@@ -1,10 +1,10 @@
 [package]
 name = "MarkFlow"
-version = "0.2.0"
+version = "1.0.0"
 description = "A Typora-like WYSIWYG Markdown editor with AI assistant"
 authors = ["you"]
-license = ""
-repository = ""
+license = "MIT"
+repository = "https://github.com/zhanjiyun/MarkFlow"
 edition = "2021"
 rust-version = "1.77.2"
 
