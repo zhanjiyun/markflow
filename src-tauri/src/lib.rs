@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
+use std::io::Read;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
+use tauri::Emitter;
 use tauri::Manager;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -79,7 +82,10 @@ async fn chat_with_ai(request: ChatRequest) -> Result<ChatResponse, String> {
     let response = client
         .post(&endpoint)
         .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", request.api_key.trim()))
+        .header(
+            "Authorization",
+            format!("Bearer {}", request.api_key.trim()),
+        )
         .json(&body)
         .send()
         .await
@@ -197,12 +203,36 @@ fn exit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
+/// Well-known localhost port for single-instance coordination.
+/// The first instance binds this port; subsequent instances connect and forward file paths.
+const INSTANCE_PORT: u16 = 48721;
+
+fn run_first_instance(startup_files: Vec<String>, listener: TcpListener) {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<String>>();
+
+    // Background thread: accept TCP connections from other instances
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if let Ok(mut stream) = stream {
+                let mut buf = String::new();
+                if stream.read_to_string(&mut buf).is_ok() {
+                    let paths: Vec<String> = buf
+                        .lines()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if !paths.is_empty() {
+                        let _ = tx.send(paths);
+                    }
+                }
+            }
+        }
+    });
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .setup(|app| {
+        .setup(move |app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -210,6 +240,26 @@ pub fn run() {
                         .build(),
                 )?;
             }
+
+            let handle = app.handle().clone();
+
+            // Emit initial startup files after a delay so the frontend has mounted
+            if !startup_files.is_empty() {
+                let handle2 = handle.clone();
+                let files = startup_files.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1200));
+                    let _ = handle2.emit("open-file-paths", files);
+                });
+            }
+
+            // Watch for incoming file paths forwarded from other instances
+            std::thread::spawn(move || {
+                for paths in rx {
+                    let _ = handle.emit("open-file-paths", paths);
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -223,4 +273,34 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn forward_to_existing_instance(startup_files: &[String]) {
+    if startup_files.is_empty() {
+        return;
+    }
+    if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", INSTANCE_PORT)) {
+        use std::io::Write;
+        let data = startup_files.join("\n");
+        // Ignore errors — the existing instance may have already shut down
+        let _ = stream.write_all(data.as_bytes());
+        let _ = stream.flush();
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run(startup_files: Vec<String>) {
+    // Single-instance coordination via TCP port binding.
+    // First instance binds the port and starts normally.
+    // Subsequent instances forward their file paths to the first instance and exit.
+    match TcpListener::bind(("127.0.0.1", INSTANCE_PORT)) {
+        Ok(listener) => {
+            run_first_instance(startup_files, listener);
+        }
+        Err(_) => {
+            // Port is already bound → another instance is running.
+            // Forward file paths to the existing instance and exit.
+            forward_to_existing_instance(&startup_files);
+        }
+    }
 }

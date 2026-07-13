@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 import ContextMenu, { type ContextMenuAction } from "./ContextMenu";
 import Editor, { type SourceEditorHandle } from "./Editor";
 import FileTree from "./FileTree";
@@ -401,6 +402,45 @@ export default function App() {
       setHomeResumeTarget(null);
     },
   });
+
+  // Listen for file-open requests from the OS (double-click in Explorer / file association).
+  // This handles both cold start (app not running) and warm start (app already running).
+  useEffect(() => {
+    let disposed = false;
+
+    const setup = async () => {
+      const unlisten = await listen<string[]>("open-file-paths", async (event) => {
+        if (disposed) return;
+        const paths = event.payload;
+        if (paths.length === 0) return;
+
+        // Bring window to front when opened via file association
+        try {
+          await getCurrentWindow().setFocus();
+        } catch {
+          // Ignore in browser dev mode
+        }
+
+        for (const filePath of paths) {
+          const opened = await openFileByPath(filePath);
+          if (opened) {
+            markInitialized();
+            setShowHome(false);
+            setHomeResumeTarget(null);
+          }
+        }
+      });
+
+      return unlisten;
+    };
+
+    const unlistenPromise = setup();
+
+    return () => {
+      disposed = true;
+      void unlistenPromise.then((fn) => fn?.());
+    };
+  }, [markInitialized, openFileByPath]);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
