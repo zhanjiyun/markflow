@@ -64,6 +64,12 @@ function createUntitledTab(name = UNTITLED_NAME): FileState {
   };
 }
 
+/** A tab is a "placeholder" when it has never been touched by the user:
+ *  no file path, no content, not pinned, not modified. */
+function isPlaceholderTab(tab: FileState): boolean {
+  return !tab.path && !tab.content.trim() && tab.saved && !tab.pinned;
+}
+
 export function useFileSystem() {
   const initialTabRef = useRef<FileState>(createUntitledTab());
   const [tabs, setTabs] = useState<FileState[]>(() => [initialTabRef.current]);
@@ -309,7 +315,18 @@ export function useFileSystem() {
       };
 
       clearPendingSave();
-      setTabs((current) => [...current, nextTab]);
+
+      // If the only existing tab is an untouched placeholder, replace it.
+      const currentTabs = tabsRef.current;
+      const onlyPlaceholder =
+        currentTabs.length === 1 && isPlaceholderTab(currentTabs[0]);
+
+      if (onlyPlaceholder) {
+        setTabs([nextTab]);
+      } else {
+        setTabs((current) => [...current, nextTab]);
+      }
+
       setActiveTabId(nextTab.id);
       setSaveStatus("saved");
       clearError();
@@ -343,7 +360,19 @@ export function useFileSystem() {
         };
 
         clearPendingSave();
-        setTabs((current) => [...current, nextTab]);
+
+        // If the only existing tab is an untouched placeholder, replace it.
+        // Otherwise add the new tab normally.
+        const currentTabs = tabsRef.current;
+        const onlyPlaceholder =
+          currentTabs.length === 1 && isPlaceholderTab(currentTabs[0]);
+
+        if (onlyPlaceholder) {
+          setTabs([nextTab]);
+        } else {
+          setTabs((current) => [...current, nextTab]);
+        }
+
         setActiveTabId(nextTab.id);
         setSaveStatus("saved");
         clearError();

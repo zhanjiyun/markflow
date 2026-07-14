@@ -253,9 +253,16 @@ fn run_first_instance(startup_files: Vec<String>, listener: TcpListener) {
                 });
             }
 
-            // Watch for incoming file paths forwarded from other instances
+            // Watch for incoming file paths forwarded from other instances.
+            // Restore the window (unminimize, show, focus) before emitting so the
+            // user sees the app come to the front when double-clicking a file.
             std::thread::spawn(move || {
                 for paths in rx {
+                    if let Some(window) = handle.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
                     let _ = handle.emit("open-file-paths", paths);
                 }
             });
