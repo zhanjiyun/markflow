@@ -29,7 +29,7 @@ export default function AppSettings({
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+      <div className="modal-content app-settings-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <h2>设置</h2>
           <button className="icon-btn" onClick={onClose}>
@@ -113,7 +113,7 @@ export default function AppSettings({
               <FolderOpen size={14} />
               数据
             </h3>
-            <p className="settings-option-desc" style={{ marginBottom: 10 }}>
+            <p className="settings-option-desc settings-data-description">
               应用数据（会话状态、未命名草稿恢复文件、AI 设置等）存储在本地应用数据目录中。
               不会上传到任何服务器。
             </p>
@@ -124,8 +124,8 @@ export default function AppSettings({
           </div>
         </div>
 
-        <div className="modal-footer" style={{ justifyContent: "space-between" }}>
-          <span style={{ fontSize: 12, color: "var(--text-muted)" }}>MarkFlow v{version}</span>
+        <div className="modal-footer settings-footer">
+          <span className="settings-version">MarkFlow v{version}</span>
           <button className="form-btn primary" onClick={onClose}>
             关闭
           </button>
