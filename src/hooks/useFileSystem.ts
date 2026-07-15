@@ -17,6 +17,7 @@ export type SaveStatus = "saved" | "unsaved" | "saving" | "error";
 type CloseStrategy = "prompt" | "save" | "discard";
 
 const AUTO_SAVE_DELAY = 1000;
+const UNTITLED_PERSIST_DELAY = 5000;
 const UNTITLED_NAME = "未命名.md";
 const UNTITLED_NAME_REGEX = /^未命名(?: (\d+))?\.md$/;
 
@@ -79,7 +80,10 @@ export function useFileSystem() {
   const tabsRef = useRef(tabs);
   const activeTabIdRef = useRef<string | null>(activeTabId);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const untitledTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const errorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Tracks the mtime of each opened file so we can detect external changes. */
+  const fileMtimesRef = useRef<Record<string, number>>({});
 
   tabsRef.current = tabs;
   activeTabIdRef.current = activeTabId;
@@ -117,6 +121,11 @@ export function useFileSystem() {
     setLastError(null);
   }, []);
 
+  /** Clean up a recovery file for a tab that got saved or closed. */
+  const cleanupUntitledDoc = useCallback((id: string) => {
+    invoke("remove_untitled_doc", { id }).catch(() => {});
+  }, []);
+
   const replaceTab = useCallback((nextTab: FileState) => {
     setTabs((current) => current.map((tab) => (tab.id === nextTab.id ? nextTab : tab)));
   }, []);
@@ -134,6 +143,10 @@ export function useFileSystem() {
         });
         setSaveStatus("saved");
         clearError();
+        // Update tracked mtime after successful save
+        fileMtimesRef.current[targetPath] = Date.now();
+        // Clean up untitled recovery file now that the tab has a real path
+        cleanupUntitledDoc(tab.id);
         return true;
       } catch (error) {
         console.error(error);
@@ -142,7 +155,7 @@ export function useFileSystem() {
         return false;
       }
     },
-    [clearError, replaceTab, showError]
+    [cleanupUntitledDoc, clearError, replaceTab, showError]
   );
 
   const saveTabAsInternal = useCallback(
@@ -222,12 +235,30 @@ export function useFileSystem() {
     [saveTabAsInternal, saveTabToPath]
   );
 
+  // ── Untitled document persistence (placed before auto-save effect that uses it) ──
+  const persistUntitledDocs = useCallback(() => {
+    const untitled = tabsRef.current.filter((t) => !t.path);
+    if (untitled.length === 0) return;
+    invoke("save_untitled_docs", {
+      docs: untitled.map((t) => ({ id: t.id, name: t.name, content: t.content })),
+    }).catch(() => {});
+  }, []);
+
+  const scheduleUntitledPersist = useCallback(() => {
+    if (untitledTimerRef.current) window.clearTimeout(untitledTimerRef.current);
+    untitledTimerRef.current = window.setTimeout(() => {
+      persistUntitledDocs();
+    }, UNTITLED_PERSIST_DELAY);
+  }, [persistUntitledDocs]);
+
   useEffect(() => {
     if (!activeTab) return;
 
     if (!activeTab.path) {
       clearPendingSave();
       setSaveStatus(activeTab.saved ? "saved" : "unsaved");
+      // Persist untitled content to disk for crash recovery
+      if (!activeTab.saved) scheduleUntitledPersist();
       return;
     }
 
@@ -244,7 +275,7 @@ export function useFileSystem() {
     }, AUTO_SAVE_DELAY);
 
     return clearPendingSave;
-  }, [activeTab, clearPendingSave, saveExistingFile]);
+  }, [activeTab, clearPendingSave, saveExistingFile, scheduleUntitledPersist]);
 
   useEffect(() => {
     const handleBlur = () => {
@@ -261,6 +292,7 @@ export function useFileSystem() {
   useEffect(() => {
     return () => {
       clearPendingSave();
+      if (untitledTimerRef.current) window.clearTimeout(untitledTimerRef.current);
       if (errorTimerRef.current) {
         window.clearTimeout(errorTimerRef.current);
       }
@@ -330,6 +362,11 @@ export function useFileSystem() {
       setActiveTabId(nextTab.id);
       setSaveStatus("saved");
       clearError();
+      // Track mtime for external change detection
+      fileMtimesRef.current[selected] = Date.now(); // fallback until real mtime
+      void invoke<number | null>("get_file_mtime", { path: selected }).then((mtime) => {
+        if (mtime != null) fileMtimesRef.current[selected] = mtime;
+      });
       return true;
     } catch (error) {
       console.error(error);
@@ -376,6 +413,11 @@ export function useFileSystem() {
         setActiveTabId(nextTab.id);
         setSaveStatus("saved");
         clearError();
+        // Track mtime for external change detection
+        fileMtimesRef.current[path] = Date.now(); // fallback
+        void invoke<number | null>("get_file_mtime", { path }).then((mtime) => {
+          if (mtime != null) fileMtimesRef.current[path] = mtime;
+        });
         return true;
       } catch (error) {
         console.error(error);
@@ -477,6 +519,13 @@ export function useFileSystem() {
       const closingSet = new Set(tabIds);
       if (closingSet.size === 0) return true;
 
+      // Clean up recovery files for untitled tabs being closed
+      for (const tab of tabsRef.current) {
+        if (closingSet.has(tab.id) && !tab.path) {
+          cleanupUntitledDoc(tab.id);
+        }
+      }
+
       clearPendingSave();
       const currentTabs = tabsRef.current;
       const nextTabs = currentTabs.filter((tab) => !closingSet.has(tab.id));
@@ -503,7 +552,7 @@ export function useFileSystem() {
       clearError();
       return true;
     },
-    [clearError, clearPendingSave]
+    [cleanupUntitledDoc, clearError, clearPendingSave]
   );
 
   const closeTabsWithStrategy = useCallback(
@@ -617,6 +666,79 @@ export function useFileSystem() {
 
   const getTabsSnapshot = useCallback(() => tabsRef.current, []);
 
+  // ── Untitled document recovery (persistence helpers are above; these are load/cleanup) ──
+
+  /** Check for orphaned untitled recovery files and return them as FileState[]. */
+  const loadUntitledRecoveryDocs = useCallback(async (): Promise<FileState[]> => {
+    try {
+      const docs = await invoke<Array<{ id: string; name: string; content: string }>>(
+        "load_untitled_docs"
+      );
+      return docs.map((d) => ({
+        id: d.id,
+        path: null,
+        name: d.name || UNTITLED_NAME,
+        content: d.content ?? "",
+        saved: false, // recovered docs are treated as unsaved
+        pinned: false,
+      }));
+    } catch {
+      return [];
+    }
+  }, []);
+
+  /** Store the mtime of a file so we can later detect external changes. */
+  const markFileCurrent = useCallback(async (path: string) => {
+    try {
+      const mtime = await invoke<number | null>("get_file_mtime", { path });
+      if (mtime != null) {
+        fileMtimesRef.current[path] = mtime;
+      }
+    } catch {
+      // Ignore — mtime tracking is best effort
+    }
+  }, []);
+
+  /** Check all open files with paths for external modifications.
+   *  Returns tabs whose on-disk mtime differs from what we recorded. */
+  const checkExternalChanges = useCallback(async (): Promise<FileState[]> => {
+    const changed: FileState[] = [];
+    for (const tab of tabsRef.current) {
+      if (!tab.path) continue;
+      try {
+        const mtime = await invoke<number | null>("get_file_mtime", { path: tab.path });
+        if (mtime == null) continue;
+        const recorded = fileMtimesRef.current[tab.path];
+        if (recorded != null && mtime > recorded) {
+          changed.push(tab);
+        }
+      } catch {
+        // Ignore — check is best effort
+      }
+    }
+    return changed;
+  }, []);
+
+  /** Reload a tab's content from disk. Only safe when the tab is unmodified. */
+  const reloadTabFromDisk = useCallback(
+    async (tabId: string): Promise<boolean> => {
+      const tab = tabsRef.current.find((t) => t.id === tabId);
+      if (!tab?.path) return false;
+      try {
+        const content = await invoke<string>("read_file_content", { path: tab.path });
+        const mtime = await invoke<number | null>("get_file_mtime", { path: tab.path });
+        replaceTab({ ...tab, content, saved: true });
+        if (mtime != null) {
+          fileMtimesRef.current[tab.path] = mtime;
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [replaceTab]
+  );
+
   return {
     file,
     tabs,
@@ -641,5 +763,10 @@ export function useFileSystem() {
     saveTabs,
     getTabsSnapshot,
     restoreTabs,
+    markFileCurrent,
+    checkExternalChanges,
+    reloadTabFromDisk,
+    loadUntitledRecoveryDocs,
+    cleanupUntitledDoc,
   };
 }

@@ -125,6 +125,25 @@ fn read_file_content(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
+/// Returns the modification time of a file as milliseconds since Unix epoch.
+/// Returns None if the file doesn't exist or the mtime can't be read.
+#[tauri::command]
+fn get_file_mtime(path: String) -> Result<Option<u64>, String> {
+    match std::fs::metadata(&path) {
+        Ok(meta) => match meta.modified() {
+            Ok(time) => {
+                let millis = time
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| e.to_string())?
+                    .as_millis() as u64;
+                Ok(Some(millis))
+            }
+            Err(_) => Ok(None),
+        },
+        Err(_) => Ok(None),
+    }
+}
+
 #[tauri::command]
 fn write_file_content(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, &content).map_err(|e| e.to_string())
@@ -176,31 +195,149 @@ fn app_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| format!("Unable to determine app data directory: {e}"))
 }
 
-fn session_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+fn session_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app_data_dir(app)?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    Ok(dir.join("session.json"))
+    Ok(dir)
 }
 
+fn session_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    session_dir(app).map(|d| d.join("session.json"))
+}
+
+/// Atomic save: write to a temp file first, then rename to the real path.
+/// Also keeps a .bak copy of the previous session so corruption of the main
+/// file (e.g. crash mid-write) can be recovered from.
 #[tauri::command]
 fn save_session(app: tauri::AppHandle, data: String) -> Result<(), String> {
-    let path = session_file_path(&app)?;
-    std::fs::write(path, data).map_err(|e| e.to_string())
+    let dir = session_dir(&app)?;
+    let path = dir.join("session.json");
+    let tmp = dir.join("session.json.tmp");
+    let bak = dir.join("session.json.bak");
+
+    // Write new session to temp file
+    std::fs::write(&tmp, data.as_bytes()).map_err(|e| format!("写入临时文件失败: {}", e))?;
+
+    // If an existing session file is present, keep it as backup
+    if path.exists() {
+        // Ignore errors on backup — best effort
+        let _ = std::fs::copy(&path, &bak);
+    }
+
+    // Atomic rename from temp to real path
+    std::fs::rename(&tmp, &path).map_err(|e| format!("替换会话文件失败: {}", e))?;
+
+    Ok(())
 }
 
 #[tauri::command]
 fn load_session(app: tauri::AppHandle) -> Result<String, String> {
-    let path = session_file_path(&app)?;
+    let dir = session_dir(&app)?;
+    let path = dir.join("session.json");
+    let bak = dir.join("session.json.bak");
+
+    // Try the main file first
     if path.exists() {
-        std::fs::read_to_string(path).map_err(|e| e.to_string())
-    } else {
-        Ok(String::new())
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if !data.trim().is_empty() {
+                return Ok(data);
+            }
+        }
     }
+
+    // Main file missing / empty / corrupt — try backup
+    if bak.exists() {
+        if let Ok(data) = std::fs::read_to_string(&bak) {
+            if !data.trim().is_empty() {
+                // Restore the backup as the main file
+                let _ = std::fs::copy(&bak, &path);
+                return Ok(data);
+            }
+        }
+    }
+
+    Ok(String::new())
+}
+
+#[tauri::command]
+fn open_app_data_dir(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = session_dir(&app)?;
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer").arg(dir).spawn().map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(dir).spawn().map_err(|e| e.to_string())?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(dir).spawn().map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
 fn exit_app(app: tauri::AppHandle) {
     app.exit(0);
+}
+
+// ── Untitled document recovery ──
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UntitledDoc {
+    id: String,
+    name: String,
+    content: String,
+}
+
+fn untitled_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = session_dir(app)?.join("untitled");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+/// Persist untitled (no-path) tab contents to disk for crash recovery.
+/// Called periodically by the frontend auto-save logic.
+#[tauri::command]
+fn save_untitled_docs(app: tauri::AppHandle, docs: Vec<UntitledDoc>) -> Result<(), String> {
+    let dir = untitled_dir(&app)?;
+    for doc in docs {
+        let path = dir.join(format!("{}.json", doc.id));
+        let json = serde_json::to_string(&doc).map_err(|e| e.to_string())?;
+        std::fs::write(&path, json.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Load all persisted untitled documents (for crash recovery).
+#[tauri::command]
+fn load_untitled_docs(app: tauri::AppHandle) -> Result<Vec<UntitledDoc>, String> {
+    let dir = untitled_dir(&app)?;
+    let mut docs = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "json") {
+                if let Ok(data) = std::fs::read_to_string(&path) {
+                    if let Ok(doc) = serde_json::from_str::<UntitledDoc>(&data) {
+                        docs.push(doc);
+                    }
+                }
+            }
+        }
+    }
+    Ok(docs)
+}
+
+/// Remove a persisted untitled document (tab was saved or closed).
+#[tauri::command]
+fn remove_untitled_doc(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let path = untitled_dir(&app)?.join(format!("{}.json", id));
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Well-known localhost port for single-instance coordination.
@@ -273,9 +410,14 @@ fn run_first_instance(startup_files: Vec<String>, listener: TcpListener) {
             chat_with_ai,
             read_file_content,
             write_file_content,
+            get_file_mtime,
             reveal_in_folder,
             save_session,
             load_session,
+            save_untitled_docs,
+            load_untitled_docs,
+            remove_untitled_doc,
+            open_app_data_dir,
             exit_app
         ])
         .run(tauri::generate_context!())

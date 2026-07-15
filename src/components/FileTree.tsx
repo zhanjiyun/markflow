@@ -2,6 +2,7 @@ import { useState, useCallback } from "react";
 import { FolderOpen, RefreshCw, Clock, X } from "lucide-react";
 import FileTreeNode from "./FileTreeNode";
 import ContextMenu from "./ContextMenu";
+import PromptDialog, { type PromptConfig } from "./PromptDialog";
 import { getFileTreeActions } from "./fileTreeActions";
 import type { ContextMenuAction } from "./ContextMenu";
 import type { FileTreeNode as FileTreeNodeType } from "../hooks/useWorkspace";
@@ -24,8 +25,8 @@ interface FileTreeProps {
   onToggleExpand: (dirPath: string) => void;
   onFileClick: (path: string) => void;
   onRefresh: () => void;
-  onCreateFile: (parentDir: string) => Promise<string | null>;
-  onRenameFile: (filePath: string) => Promise<boolean>;
+  onCreateFile: (parentDir: string, fileName: string) => Promise<string | null>;
+  onRenameFile: (filePath: string, newName: string) => Promise<boolean>;
   onDeleteFile: (filePath: string) => Promise<boolean>;
 }
 
@@ -55,6 +56,45 @@ export default function FileTree({
     items: ContextMenuAction[];
   } | null>(null);
 
+  const [promptConfig, setPromptConfig] = useState<PromptConfig | null>(null);
+
+  const handleCreateFilePrompt = useCallback(
+    (parentPath: string) => {
+      setPromptConfig({
+        title: "新建文件",
+        message: `在文件夹中创建新的 Markdown 文件`,
+        defaultValue: "",
+        confirmLabel: "创建",
+        onConfirm: (name) => {
+          setPromptConfig(null);
+          onCreateFile(parentPath, name).then((path) => {
+            if (path) onFileClick(path);
+          });
+        },
+        onCancel: () => setPromptConfig(null),
+      });
+    },
+    [onCreateFile, onFileClick]
+  );
+
+  const handleRenameFilePrompt = useCallback(
+    (filePath: string) => {
+      const oldName = filePath.replace(/\\/g, "/").split("/").pop() || "";
+      setPromptConfig({
+        title: "重命名",
+        message: `输入新文件名`,
+        defaultValue: oldName,
+        confirmLabel: "确定",
+        onConfirm: (newName) => {
+          setPromptConfig(null);
+          onRenameFile(filePath, newName);
+        },
+        onCancel: () => setPromptConfig(null),
+      });
+    },
+    [onRenameFile]
+  );
+
   const handleContextMenu = useCallback(
     (e: React.MouseEvent, filePath: string, isDir: boolean) => {
       e.preventDefault();
@@ -64,17 +104,13 @@ export default function FileTree({
         items: getFileTreeActions(
           filePath,
           isDir,
-          (parentPath) => {
-            onCreateFile(parentPath).then((path) => {
-              if (path) onFileClick(path);
-            });
-          },
-          onRenameFile,
+          handleCreateFilePrompt,
+          handleRenameFilePrompt,
           onDeleteFile
         ),
       });
     },
-    [onCreateFile, onRenameFile, onDeleteFile, onFileClick]
+    [handleCreateFilePrompt, handleRenameFilePrompt, onDeleteFile]
   );
 
   const handleWorkspaceContextMenu = useCallback(
@@ -230,6 +266,8 @@ export default function FileTree({
           onClose={() => setContextMenu(null)}
         />
       )}
+
+      <PromptDialog config={promptConfig} />
     </div>
   );
 }

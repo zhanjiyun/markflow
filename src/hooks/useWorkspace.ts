@@ -24,8 +24,8 @@ interface UseWorkspaceReturn {
   openFolderByPath: (path: string) => Promise<void>;
   toggleExpand: (dirPath: string) => Promise<void>;
   refreshTree: () => Promise<void>;
-  createFile: (parentDir: string) => Promise<string | null>;
-  renameFile: (filePath: string) => Promise<boolean>;
+  createFile: (parentDir: string, fileName: string) => Promise<string | null>;
+  renameFile: (filePath: string, newName: string) => Promise<boolean>;
   deleteFile: (filePath: string) => Promise<boolean>;
 }
 
@@ -263,14 +263,14 @@ export function useWorkspace(): UseWorkspaceReturn {
     [hydrateExpandedTree, readDirectory]
   );
 
+  /** Create a new Markdown file. `fileName` is the user-entered name (may omit .md). */
   const createFile = useCallback(
-    async (parentDir: string): Promise<string | null> => {
-      const rawName = prompt("输入文件名");
-      const name = rawName?.trim();
+    async (parentDir: string, fileName: string): Promise<string | null> => {
+      const name = fileName.trim();
       if (!name) return null;
 
-      const fileName = MARKDOWN_FILE_RE.test(name) ? name : `${name}.md`;
-      const filePath = joinPath(parentDir, fileName);
+      const finalName = MARKDOWN_FILE_RE.test(name) ? name : `${name}.md`;
+      const filePath = joinPath(parentDir, finalName);
 
       try {
         await writeTextFile(filePath, "");
@@ -284,15 +284,15 @@ export function useWorkspace(): UseWorkspaceReturn {
     [refreshTree]
   );
 
+  /** Rename a file. `newName` is the user-entered name. */
   const renameFile = useCallback(
-    async (filePath: string): Promise<boolean> => {
+    async (filePath: string, newName: string): Promise<boolean> => {
       const oldName = filePath.replace(/\\/g, "/").split("/").pop() || "";
-      const rawName = prompt("重命名为", oldName);
-      const newName = rawName?.trim();
-      if (!newName || newName === oldName) return false;
+      const name = newName.trim();
+      if (!name || name === oldName) return false;
 
       const parentDir = filePath.replace(/\\/g, "/").split("/").slice(0, -1).join("/");
-      const newPath = `${parentDir}/${newName}`;
+      const newPath = `${parentDir}/${name}`;
 
       try {
         await rename(filePath, newPath);

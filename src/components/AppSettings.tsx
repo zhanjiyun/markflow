@@ -1,4 +1,4 @@
-import { X, Bot, Keyboard, PlaySquare } from "lucide-react";
+import { X, Bot, Keyboard, PlaySquare, FolderOpen } from "lucide-react";
 import type { AISettings as AISettingsType } from "../hooks/useAI";
 import type { StartupBehavior } from "../hooks/useSession";
 
@@ -9,7 +9,9 @@ interface AppSettingsProps {
   onStartupBehaviorChange: (behavior: StartupBehavior) => void;
   aiSettings: AISettingsType;
   onOpenAISettings: () => void;
+  onOpenDataDir: () => void;
   onClose: () => void;
+  version: string;
 }
 
 export default function AppSettings({
@@ -19,7 +21,9 @@ export default function AppSettings({
   onStartupBehaviorChange,
   aiSettings,
   onOpenAISettings,
+  onOpenDataDir,
   onClose,
+  version,
 }: AppSettingsProps) {
   const hasAIKey = !!aiSettings.apiKey;
 
@@ -97,13 +101,31 @@ export default function AppSettings({
               <div><kbd>Ctrl + O</kbd> <span>打开文件</span></div>
               <div><kbd>Ctrl + N</kbd> <span>新建文件</span></div>
               <div><kbd>Ctrl + /</kbd> <span>切换源码/WYSIWYG</span></div>
+              <div><kbd>Ctrl + P</kbd> <span>快速切换文件</span></div>
+              <div><kbd>Ctrl + F / Ctrl + H</kbd> <span>查找 / 替换</span></div>
               <div><kbd>Ctrl + Shift + E</kbd> <span>切换侧边栏</span></div>
-              <div><kbd>Ctrl + Shift + I</kbd> <span>切换 AI 助手</span></div>
+              <div><kbd>F11</kbd> <span>专注模式</span></div>
             </div>
+          </div>
+
+          <div className="settings-section">
+            <h3>
+              <FolderOpen size={14} />
+              数据
+            </h3>
+            <p className="settings-option-desc" style={{ marginBottom: 10 }}>
+              应用数据（会话状态、未命名草稿恢复文件、AI 设置等）存储在本地应用数据目录中。
+              不会上传到任何服务器。
+            </p>
+            <button className="form-btn secondary" onClick={onOpenDataDir}>
+              <FolderOpen size={14} style={{ marginRight: 6 }} />
+              打开数据目录
+            </button>
           </div>
         </div>
 
-        <div className="modal-footer">
+        <div className="modal-footer" style={{ justifyContent: "space-between" }}>
+          <span style={{ fontSize: 12, color: "var(--text-muted)" }}>MarkFlow v{version}</span>
           <button className="form-btn primary" onClick={onClose}>
             关闭
           </button>

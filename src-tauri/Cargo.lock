@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "MarkFlow"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "log",
  "reqwest 0.12.28",

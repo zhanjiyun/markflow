@@ -20,8 +20,7 @@ import {
   ZoomIn,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { listen } from "@tauri-apps/api/event";
+import { LogicalPosition, LogicalSize, getCurrentWindow } from "@tauri-apps/api/window";
 import ContextMenu, { type ContextMenuAction } from "./ContextMenu";
 import Editor, { type SourceEditorHandle } from "./Editor";
 import FileTree from "./FileTree";
@@ -32,6 +31,7 @@ import Toolbar from "./Toolbar";
 import Welcome from "./Welcome";
 import type { WysiwygEditorHandle } from "./WysiwygEditor";
 import { useAI } from "../hooks/useAI";
+import { useAppLifecycle } from "../hooks/useAppLifecycle";
 import { useDragDrop } from "../hooks/useDragDrop";
 import { useFileSystem } from "../hooks/useFileSystem";
 import { useRecentFiles } from "../hooks/useRecentFiles";
@@ -144,6 +144,9 @@ export default function App() {
     saveTabs,
     getTabsSnapshot,
     restoreTabs,
+    checkExternalChanges,
+    reloadTabFromDisk,
+    loadUntitledRecoveryDocs,
   } = useFileSystem();
   const {
     workspacePath,
@@ -214,6 +217,7 @@ export default function App() {
     items: ContextMenuAction[];
   } | null>(null);
   const [sessionReady, setSessionReady] = useState(false);
+  const [toastMsg, setToastMsg] = useState<string | null>(null);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const sourcePaneRef = useRef<HTMLDivElement>(null);
@@ -225,6 +229,13 @@ export default function App() {
   const previewSearchRef = useRef<SearchableEditorHandle | null>(null);
   const tabViewStatesRef = useRef<Record<string, TabViewState>>({});
   const allowWindowCloseRef = useRef(false);
+  /** Snapshot of window geometry captured before session save. */
+  const windowGeomRef = useRef<{
+    windowX?: number;
+    windowY?: number;
+    windowWidth?: number;
+    windowHeight?: number;
+  }>({});
 
   useZoom({
     enabled: true,
@@ -240,6 +251,24 @@ export default function App() {
   const charCount = useMemo(() => getCharCount(file.content), [file.content]);
 
   const captureActiveTabViewState = useCallback(() => {
+    // Also capture window geometry for session restore
+    try {
+      void getCurrentWindow().outerPosition().then((pos) => {
+        windowGeomRef.current = {
+          ...windowGeomRef.current,
+          windowX: pos.x,
+          windowY: pos.y,
+        };
+      });
+      void getCurrentWindow().outerSize().then((size) => {
+        windowGeomRef.current = {
+          ...windowGeomRef.current,
+          windowWidth: size.width,
+          windowHeight: size.height,
+        };
+      });
+    } catch { /* browser dev mode */ }
+
     if (!activeTabId) return;
 
     const nextState: TabViewState = {
@@ -332,6 +361,8 @@ export default function App() {
         activeTabId: resolvedActiveTabId,
         workspacePath,
         currentFilePath: currentPath,
+        // Window geometry saved from latest capture (best effort)
+        ...windowGeomRef.current,
       };
     },
     [
@@ -354,6 +385,27 @@ export default function App() {
       zenMode,
     ]
   );
+
+  // ── App lifecycle (window close, file-open events, external change detection) ──
+  useAppLifecycle({
+    openFileByPath,
+    saveSession,
+    checkExternalChanges,
+    reloadTabFromDisk,
+    allowWindowCloseRef,
+    captureActiveTabViewState,
+    getTabsSnapshot,
+    buildSessionState,
+    activeTabId,
+    appCloseRequestDirty: appCloseRequest ? 1 : 0,
+    onExternalChange: (count) => {
+      setToastMsg(`检测到 ${count} 个文件被外部修改，已自动重载。`);
+    },
+    setInitialized,
+    setShowHome,
+    setHomeResumeTarget,
+    setAppCloseRequest,
+  });
 
   const toggleTheme = useCallback(() => {
     setTheme((current) => (current === "light" ? "dark" : "light"));
@@ -403,44 +455,7 @@ export default function App() {
     },
   });
 
-  // Listen for file-open requests from the OS (double-click in Explorer / file association).
-  // This handles both cold start (app not running) and warm start (app already running).
-  useEffect(() => {
-    let disposed = false;
-
-    const setup = async () => {
-      const unlisten = await listen<string[]>("open-file-paths", async (event) => {
-        if (disposed) return;
-        const paths = event.payload;
-        if (paths.length === 0) return;
-
-        // Bring window to front when opened via file association
-        try {
-          await getCurrentWindow().setFocus();
-        } catch {
-          // Ignore in browser dev mode
-        }
-
-        for (const filePath of paths) {
-          const opened = await openFileByPath(filePath);
-          if (opened) {
-            markInitialized();
-            setShowHome(false);
-            setHomeResumeTarget(null);
-          }
-        }
-      });
-
-      return unlisten;
-    };
-
-    const unlistenPromise = setup();
-
-    return () => {
-      disposed = true;
-      void unlistenPromise.then((fn) => fn?.());
-    };
-  }, [markInitialized, openFileByPath]);
+  // File-open listener and external change detection are now in useAppLifecycle hook.
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -480,6 +495,13 @@ export default function App() {
     if (!workspacePath) return;
     addRecentWorkspace(workspacePath);
   }, [addRecentWorkspace, workspacePath]);
+
+  // Auto-dismiss toast
+  useEffect(() => {
+    if (!toastMsg) return;
+    const timer = window.setTimeout(() => setToastMsg(null), 4000);
+    return () => window.clearTimeout(timer);
+  }, [toastMsg]);
 
   useEffect(() => {
     if (tabs.length === 0 && homeResumeTarget) {
@@ -528,6 +550,27 @@ export default function App() {
       setZenMode(session.zenMode);
       setPreviewFontScale(clampScale(session.previewFontScale));
       setStartupBehavior(session.startupBehavior ?? DEFAULT_SESSION.startupBehavior);
+
+      // Restore window geometry (with bounds validation)
+      if (
+        session.windowX != null &&
+        session.windowY != null &&
+        session.windowWidth != null &&
+        session.windowHeight != null
+      ) {
+        const minW = 800;
+        const minH = 600;
+        const w = Math.max(minW, session.windowWidth);
+        const h = Math.max(minH, session.windowHeight);
+        // Clamp position so at least part of the window is on screen
+        const x = Math.max(-w + 100, session.windowX);
+        const y = Math.max(-40, session.windowY);
+        try {
+          void getCurrentWindow().setPosition(new LogicalPosition(x, y));
+          void getCurrentWindow().setSize(new LogicalSize(w, h));
+        } catch { /* browser dev mode */ }
+      }
+
       tabViewStatesRef.current = Object.fromEntries(
         session.openTabs.map((tab) => [tab.id, tab.viewState ?? {}])
       );
@@ -564,6 +607,18 @@ export default function App() {
         setInitialized(true);
       }
 
+      // Recover orphaned untitled documents from disk
+      if (!cancelled && session.openTabs.length === 0) {
+        try {
+          const recoveredDocs = await loadUntitledRecoveryDocs();
+          if (recoveredDocs.length > 0) {
+            // Only recover if no real tabs were restored (avoid duplicates)
+            restoreTabs(recoveredDocs, recoveredDocs[0].id);
+            setInitialized(true);
+          }
+        } catch { /* ignore recovery errors */ }
+      }
+
       if (!cancelled) {
         setSessionReady(true);
       }
@@ -572,7 +627,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [loadSession, openFileByPath, openFolderByPath, restoreTabs]);
+  }, [loadSession, loadUntitledRecoveryDocs, openFileByPath, openFolderByPath, restoreTabs]);
 
   useEffect(() => {
     if (!sessionReady) return;
@@ -928,19 +983,6 @@ export default function App() {
     return getTabsSnapshot();
   }, [getTabsSnapshot]);
 
-  const requestWindowClose = useCallback(async (): Promise<boolean> => {
-    allowWindowCloseRef.current = true;
-
-    try {
-      await invoke("exit_app");
-      return true;
-    } catch (error) {
-      allowWindowCloseRef.current = false;
-      console.error("Failed to exit app:", error);
-      return false;
-    }
-  }, []);
-
   const finalizeWindowClose = useCallback(
     async (strategy: "save" | "discard"): Promise<boolean> => {
       captureActiveTabViewState();
@@ -997,14 +1039,15 @@ export default function App() {
         console.error("Failed to save session before closing:", error);
       }
 
-      return requestWindowClose();
+      allowWindowCloseRef.current = true;
+      await invoke("exit_app");
+      return true;
     },
     [
       activeTabId,
       buildSessionState,
       captureActiveTabViewState,
       getTabsSnapshot,
-      requestWindowClose,
       saveSession,
       saveTabs,
       waitForTabsSnapshot,
@@ -1153,48 +1196,7 @@ export default function App() {
     });
   }, [bulkCloseRequest, executeBulkCloseRequest]);
 
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-
-    try {
-      void getCurrentWindow()
-        .onCloseRequested(async (event) => {
-          if (allowWindowCloseRef.current) {
-            return;
-          }
-
-          event.preventDefault();
-          captureActiveTabViewState();
-
-          const sessionTabs = getTabsSnapshot();
-          const unsavedTabs = sessionTabs
-            .filter((tab) => !tab.saved)
-            .map((tab) => ({ id: tab.id, name: tab.name, path: tab.path }));
-
-          if (unsavedTabs.length === 0) {
-            const currentPath =
-              sessionTabs.find((tab) => tab.id === activeTabId)?.path ?? null;
-
-            await saveSession(buildSessionState(sessionTabs, activeTabId, currentPath)).catch((error) => {
-              console.error("Failed to save session before closing:", error);
-            });
-            await requestWindowClose();
-            return;
-          }
-
-          setAppCloseRequest({ unsavedTabs });
-        })
-        .then((dispose) => {
-          unlisten = dispose;
-        });
-    } catch {
-      // Ignore in browser dev mode.
-    }
-
-    return () => {
-      unlisten?.();
-    };
-  }, [activeTabId, buildSessionState, captureActiveTabViewState, getTabsSnapshot, requestWindowClose, saveSession]);
+  // Window close request handling is now in useAppLifecycle hook.
 
   const handleStartRenameTab = useCallback((tabId: string) => {
     const tab = tabs.find((item) => item.id === tabId);
@@ -1832,6 +1834,8 @@ export default function App() {
         previewZoom={previewFontScale}
       />
 
+      {toastMsg && <div className="toast-bar">{toastMsg}</div>}
+
       {!isWysiwyg && <SelectionToolbar onFormat={handleFormat} />}
 
       <Suspense fallback={<ModalFallback />}>
@@ -1860,6 +1864,10 @@ export default function App() {
               setShowAppSettings(false);
               setShowAISettings(true);
             }}
+            onOpenDataDir={() => {
+              void invoke("open_app_data_dir").catch(() => {});
+            }}
+            version="1.0.2"
             onClose={() => setShowAppSettings(false)}
           />
         )}

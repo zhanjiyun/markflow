@@ -1,0 +1,180 @@
+import { useCallback, useEffect, useRef } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
+import type { SessionState } from "./useSession";
+import type { FileState } from "./useFileSystem";
+
+interface UseAppLifecycleParams {
+  openFileByPath: (path: string) => Promise<boolean>;
+  saveSession: (state: SessionState) => Promise<void>;
+  checkExternalChanges: () => Promise<FileState[]>;
+  reloadTabFromDisk: (tabId: string) => Promise<boolean>;
+  allowWindowCloseRef: React.MutableRefObject<boolean>;
+  captureActiveTabViewState: () => void;
+  getTabsSnapshot: () => FileState[];
+  buildSessionState: (
+    sessionTabs?: FileState[],
+    sessionActiveTabId?: string | null,
+    currentPath?: string | null
+  ) => SessionState;
+  activeTabId: string | null;
+  /** Needed to re-register the close listener after dialog dismiss (Tauri 2 quirk) */
+  appCloseRequestDirty: number;
+  /** Called when external file modifications are detected (for non-blocking toast). */
+  onExternalChange?: (count: number) => void;
+  setInitialized: (v: boolean) => void;
+  setShowHome: (v: boolean) => void;
+  setHomeResumeTarget: (v: { path: string; name: string } | null) => void;
+  setAppCloseRequest: (
+    v: { unsavedTabs: Array<{ id: string; name: string; path: string | null }> } | null
+  ) => void;
+}
+
+/**
+ * Consolidates window-level lifecycle concerns:
+ *   - External file-open events (file association / single-instance forwarding)
+ *   - Window close request handling (unsaved-tab confirmation)
+ *   - External file change detection on window focus
+ */
+export function useAppLifecycle(params: UseAppLifecycleParams) {
+  const {
+    openFileByPath,
+    saveSession,
+    checkExternalChanges,
+    reloadTabFromDisk,
+    allowWindowCloseRef,
+    captureActiveTabViewState,
+    getTabsSnapshot,
+    buildSessionState,
+    activeTabId,
+    appCloseRequestDirty,
+    onExternalChange,
+    setInitialized,
+    setShowHome,
+    setHomeResumeTarget,
+    setAppCloseRequest,
+  } = params;
+
+  // ── 1. External file-open listener (OS file association / single-instance forwarding) ──
+  useEffect(() => {
+    let disposed = false;
+    const setup = async () => {
+      const unlisten = await listen<string[]>("open-file-paths", async (event) => {
+        if (disposed) return;
+        const paths = event.payload;
+        if (paths.length === 0) return;
+
+        try {
+          await getCurrentWindow().setFocus();
+        } catch { /* browser dev mode */ }
+
+        for (const filePath of paths) {
+          const opened = await openFileByPath(filePath);
+          if (opened) {
+            setInitialized(true);
+            setShowHome(false);
+            setHomeResumeTarget(null);
+          }
+        }
+      });
+      return unlisten;
+    };
+
+    const unlistenPromise = setup();
+    return () => {
+      disposed = true;
+      void unlistenPromise.then((fn) => fn?.());
+    };
+  }, [openFileByPath, setInitialized, setShowHome, setHomeResumeTarget]);
+
+  // ── 2. Window close helper (shared by direct-close and dialog-confirm paths) ──
+  const requestWindowClose = useCallback(async (): Promise<boolean> => {
+    allowWindowCloseRef.current = true;
+    try {
+      await getCurrentWindow().close();
+      return true;
+    } catch {
+      return false;
+    }
+  }, [allowWindowCloseRef]);
+
+  // ── 3. Window close request handler ──
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    try {
+      void getCurrentWindow()
+        .onCloseRequested(async (event) => {
+          if (allowWindowCloseRef.current) return;
+          event.preventDefault();
+          captureActiveTabViewState();
+
+          const sessionTabs = getTabsSnapshot();
+          const unsavedTabs = sessionTabs
+            .filter((tab) => !tab.saved)
+            .map((tab) => ({ id: tab.id, name: tab.name, path: tab.path }));
+
+          if (unsavedTabs.length === 0) {
+            const currentPath =
+              sessionTabs.find((tab) => tab.id === activeTabId)?.path ?? null;
+            await saveSession(
+              buildSessionState(sessionTabs, activeTabId, currentPath)
+            ).catch((e) => console.error("Failed to save session before close:", e));
+            await requestWindowClose();
+            return;
+          }
+
+          setAppCloseRequest({ unsavedTabs });
+        })
+        .then((dispose) => {
+          unlisten = dispose;
+        });
+    } catch { /* browser dev mode */ }
+
+    return () => {
+      unlisten?.();
+    };
+  }, [
+    activeTabId,
+    appCloseRequestDirty,
+    buildSessionState,
+    captureActiveTabViewState,
+    getTabsSnapshot,
+    saveSession,
+    setAppCloseRequest,
+    requestWindowClose,
+    allowWindowCloseRef,
+  ]);
+
+  // ── 4. External file change detection on window focus ──
+  const checkingRef = useRef(false);
+  useEffect(() => {
+    const handleFocus = () => {
+      if (checkingRef.current) return;
+      checkingRef.current = true;
+      void checkExternalChanges().then((changedTabs) => {
+        checkingRef.current = false;
+        if (changedTabs.length === 0) return;
+        let reloaded = 0;
+        for (const tab of changedTabs) {
+          if (tab.saved) {
+            void reloadTabFromDisk(tab.id);
+            reloaded++;
+          }
+        }
+        const skipped = changedTabs.length - reloaded;
+        // Notify the UI (toast)
+        if (reloaded > 0) onExternalChange?.(reloaded);
+        // If some tabs were skipped (user-modified), log it
+        if (skipped > 0) {
+          console.info(
+            `Skipped ${skipped} externally modified tab(s) with unsaved local changes.`
+          );
+        }
+      });
+    };
+    window.addEventListener("focus", handleFocus);
+    return () => window.removeEventListener("focus", handleFocus);
+  }, [checkExternalChanges, onExternalChange, reloadTabFromDisk]);
+
+  return { requestWindowClose };
+}

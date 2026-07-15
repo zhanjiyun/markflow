@@ -31,6 +31,11 @@ export interface SessionState {
   activeTabId: string | null;
   workspacePath: string | null;
   currentFilePath: string | null;
+  /** Window geometry for session restore (optional for backward compat) */
+  windowX?: number;
+  windowY?: number;
+  windowWidth?: number;
+  windowHeight?: number;
 }
 
 export function useSession() {

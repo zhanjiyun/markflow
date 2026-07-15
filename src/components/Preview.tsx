@@ -1,4 +1,4 @@
-import { useMemo, useRef, useEffect, useCallback, useState, type MutableRefObject } from "react";
+import { useMemo, useRef, useEffect, useLayoutEffect, useCallback, type MutableRefObject } from "react";
 import { renderMarkdown } from "../utils/markdown";
 import { findTextMatches } from "../utils/textSearch";
 import type { EditorSearchMatch, SearchableEditorHandle } from "../types/editorSearch";
@@ -43,54 +43,69 @@ function findSegment(segments: TextNodeSegment[], offset: number): TextNodeSegme
   return null;
 }
 
-function CodeCopyButtons({ html }: { html: string }) {
-  const [copiedIndex, setCopiedIndex] = useState(-1);
+const COPY_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>';
+const COPIED_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>';
 
-  const handleCopy = useCallback((code: string, i: number) => {
-    navigator.clipboard.writeText(code);
-    setCopiedIndex(i);
-    setTimeout(() => setCopiedIndex(-1), 2000);
+/**
+ * Attaches copy buttons to code blocks using event delegation.
+ * Uses useLayoutEffect so buttons are in place before the browser paints,
+ * and only wraps unwrapped blocks (avoids removing/re-adding on every render).
+ */
+function CodeCopyButtons({ html }: { html: string }) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const btnByBlock = useRef<WeakMap<Element, HTMLButtonElement>>(new WeakMap());
+
+  // Delegated click handler: detect clicks on copy buttons
+  const handleContainerClick = useCallback((e: Event) => {
+    const btn = (e.target as HTMLElement).closest(".code-copy-btn") as HTMLButtonElement | null;
+    if (!btn) return;
+
+    const wrapper = btn.closest(".code-block-wrapper");
+    const code = wrapper?.querySelector("pre code");
+    if (!code?.textContent) return;
+
+    navigator.clipboard.writeText(code.textContent);
+    btn.innerHTML = COPIED_SVG;
+    setTimeout(() => {
+      btn.innerHTML = COPY_SVG;
+    }, 2000);
   }, []);
 
-  useEffect(() => {
-    const blocks = document.querySelectorAll(".preview-content pre code");
-    const existingButtons = document.querySelectorAll(".code-copy-btn");
-    existingButtons.forEach((b) => b.remove());
+  // Attach wrappers and buttons on DOM change, using the stable container
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
 
-    blocks.forEach((block, i) => {
-      const pre = block.parentElement;
-      if (!pre) return;
+    const pres = container.querySelectorAll("pre");
+    pres.forEach((pre) => {
+      // Already wrapped?
+      if (pre.parentElement?.classList.contains("code-block-wrapper")) return;
 
-      // Wrap in container
-      if (!pre.parentElement?.classList.contains("code-block-wrapper")) {
-        const wrapper = document.createElement("div");
-        wrapper.className = "code-block-wrapper";
-        pre.parentNode?.insertBefore(wrapper, pre);
-        wrapper.appendChild(pre);
-      }
+      const wrapper = document.createElement("div");
+      wrapper.className = "code-block-wrapper";
+      pre.parentNode?.insertBefore(wrapper, pre);
+      wrapper.appendChild(pre);
 
-      const wrapper = pre.parentElement;
-      if (!wrapper?.classList.contains("code-block-wrapper")) return;
-
-      // Remove old button if any
-      const old = wrapper.querySelector(".code-copy-btn");
-      if (old) old.remove();
-
-      // Add copy button
       const btn = document.createElement("button");
       btn.className = "code-copy-btn";
       btn.title = "复制代码";
-      btn.innerHTML = copiedIndex === i
-        ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>'
-        : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>';
-
-      btn.addEventListener("click", () => {
-        handleCopy((block as HTMLElement).textContent || "", i);
-      });
-
+      btn.innerHTML = COPY_SVG;
       wrapper.appendChild(btn);
+      btnByBlock.current.set(pre, btn);
     });
-  }, [html, copiedIndex, handleCopy]);
+  }, [html]);
+
+  // Attach and detach the delegated listener via the preview container
+  useEffect(() => {
+    const container = document.querySelector(".preview-content");
+    if (!container) return;
+    container.addEventListener("click", handleContainerClick as EventListener);
+    // Store ref for useLayoutEffect
+    containerRef.current = container as HTMLDivElement;
+    return () => {
+      container.removeEventListener("click", handleContainerClick as EventListener);
+    };
+  }, [handleContainerClick]);
 
   return null;
 }

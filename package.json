@@ -8,6 +8,8 @@
     "build": "tsc -b && vite build",
     "test:markdown": "node tests/run-tests.cjs",
     "test:spec": "node tests/run-spec-tests.cjs",
+    "test:untitled": "node tests/untitled-recovery.test.cjs",
+    "test:filesystem": "node tests/filesystem-logic.test.cjs",
     "lint": "oxlint",
     "preview": "vite preview"
   },
