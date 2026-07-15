@@ -3,6 +3,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import { readTextFile } from "@tauri-apps/plugin-fs";
 import type { SessionTabState } from "./useSession";
+import {
+  UNTITLED_NAME,
+  getFileName,
+  getNextUntitledName,
+  selectNextActive,
+  shouldReplacePlaceholder,
+} from "./fileSystemLogic";
 
 export interface FileState {
   id: string;
@@ -18,15 +25,9 @@ type CloseStrategy = "prompt" | "save" | "discard";
 
 const AUTO_SAVE_DELAY = 1000;
 const UNTITLED_PERSIST_DELAY = 5000;
-const UNTITLED_NAME = "未命名.md";
-const UNTITLED_NAME_REGEX = /^未命名(?: (\d+))?\.md$/;
 
 function writeFileRust(path: string, content: string): Promise<void> {
   return invoke("write_file_content", { path, content });
-}
-
-function getFileName(path: string): string {
-  return path.replace(/\\/g, "/").split("/").pop() || UNTITLED_NAME;
 }
 
 function createTabId(): string {
@@ -35,23 +36,6 @@ function createTabId(): string {
   }
 
   return `tab-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function getNextUntitledName(existingTabs: FileState[]): string {
-  const usedNumbers = new Set<number>();
-
-  for (const tab of existingTabs) {
-    const match = tab.name.match(UNTITLED_NAME_REGEX);
-    if (!match) continue;
-    usedNumbers.add(match[1] ? Number.parseInt(match[1], 10) : 1);
-  }
-
-  let nextNumber = 1;
-  while (usedNumbers.has(nextNumber)) {
-    nextNumber += 1;
-  }
-
-  return nextNumber === 1 ? UNTITLED_NAME : `未命名 ${nextNumber}.md`;
 }
 
 function createUntitledTab(name = UNTITLED_NAME): FileState {
@@ -63,12 +47,6 @@ function createUntitledTab(name = UNTITLED_NAME): FileState {
     saved: true,
     pinned: false,
   };
-}
-
-/** A tab is a "placeholder" when it has never been touched by the user:
- *  no file path, no content, not pinned, not modified. */
-function isPlaceholderTab(tab: FileState): boolean {
-  return !tab.path && !tab.content.trim() && tab.saved && !tab.pinned;
 }
 
 export function useFileSystem() {
@@ -122,12 +100,18 @@ export function useFileSystem() {
   }, []);
 
   /** Clean up a recovery file for a tab that got saved or closed. */
-  const cleanupUntitledDoc = useCallback((id: string) => {
-    invoke("remove_untitled_doc", { id }).catch(() => {});
+  const cleanupUntitledDoc = useCallback(async (id: string): Promise<void> => {
+    try {
+      await invoke("remove_untitled_doc", { id });
+    } catch {
+      // Recovery cleanup is best effort during normal editing.
+    }
   }, []);
 
   const replaceTab = useCallback((nextTab: FileState) => {
-    setTabs((current) => current.map((tab) => (tab.id === nextTab.id ? nextTab : tab)));
+    const nextTabs = tabsRef.current.map((tab) => (tab.id === nextTab.id ? nextTab : tab));
+    tabsRef.current = nextTabs;
+    setTabs(nextTabs);
   }, []);
 
   const saveTabToPath = useCallback(
@@ -135,6 +119,9 @@ export function useFileSystem() {
       setSaveStatus("saving");
       try {
         await writeFileRust(targetPath, tab.content);
+        const mtime = await invoke<number | null>("get_file_mtime", { path: targetPath }).catch(
+          () => null
+        );
         replaceTab({
           ...tab,
           path: targetPath,
@@ -143,10 +130,11 @@ export function useFileSystem() {
         });
         setSaveStatus("saved");
         clearError();
-        // Update tracked mtime after successful save
-        fileMtimesRef.current[targetPath] = Date.now();
+        if (mtime != null) {
+          fileMtimesRef.current[targetPath] = mtime;
+        }
         // Clean up untitled recovery file now that the tab has a real path
-        cleanupUntitledDoc(tab.id);
+        void cleanupUntitledDoc(tab.id);
         return true;
       } catch (error) {
         console.error(error);
@@ -185,6 +173,7 @@ export function useFileSystem() {
     }
 
     clearPendingSave();
+    activeTabIdRef.current = tabId;
     setActiveTabId(tabId);
   }, [clearPendingSave, saveTabToPath]);
 
@@ -310,7 +299,10 @@ export function useFileSystem() {
   const newFile = useCallback(async (): Promise<boolean> => {
     const nextTab = createUntitledTab(getNextUntitledName(tabsRef.current));
     clearPendingSave();
-    setTabs((current) => [...current, nextTab]);
+    const nextTabs = [...tabsRef.current, nextTab];
+    tabsRef.current = nextTabs;
+    activeTabIdRef.current = nextTab.id;
+    setTabs(nextTabs);
     setActiveTabId(nextTab.id);
     setSaveStatus("saved");
     clearError();
@@ -336,7 +328,10 @@ export function useFileSystem() {
         return true;
       }
 
-      const content = await readTextFile(selected);
+      const [content, mtime] = await Promise.all([
+        readTextFile(selected),
+        invoke<number | null>("get_file_mtime", { path: selected }).catch(() => null),
+      ]);
       const nextTab: FileState = {
         id: createTabId(),
         path: selected,
@@ -350,23 +345,22 @@ export function useFileSystem() {
 
       // If the only existing tab is an untouched placeholder, replace it.
       const currentTabs = tabsRef.current;
-      const onlyPlaceholder =
-        currentTabs.length === 1 && isPlaceholderTab(currentTabs[0]);
+      const onlyPlaceholder = shouldReplacePlaceholder(currentTabs);
 
       if (onlyPlaceholder) {
+        tabsRef.current = [nextTab];
         setTabs([nextTab]);
       } else {
-        setTabs((current) => [...current, nextTab]);
+        const nextTabs = [...currentTabs, nextTab];
+        tabsRef.current = nextTabs;
+        setTabs(nextTabs);
       }
 
+      activeTabIdRef.current = nextTab.id;
       setActiveTabId(nextTab.id);
       setSaveStatus("saved");
       clearError();
-      // Track mtime for external change detection
-      fileMtimesRef.current[selected] = Date.now(); // fallback until real mtime
-      void invoke<number | null>("get_file_mtime", { path: selected }).then((mtime) => {
-        if (mtime != null) fileMtimesRef.current[selected] = mtime;
-      });
+      if (mtime != null) fileMtimesRef.current[selected] = mtime;
       return true;
     } catch (error) {
       console.error(error);
@@ -386,7 +380,10 @@ export function useFileSystem() {
       }
 
       try {
-        const content = await invoke<string>("read_file_content", { path });
+        const [content, mtime] = await Promise.all([
+          invoke<string>("read_file_content", { path }),
+          invoke<number | null>("get_file_mtime", { path }).catch(() => null),
+        ]);
         const nextTab: FileState = {
           id: createTabId(),
           path,
@@ -401,23 +398,22 @@ export function useFileSystem() {
         // If the only existing tab is an untouched placeholder, replace it.
         // Otherwise add the new tab normally.
         const currentTabs = tabsRef.current;
-        const onlyPlaceholder =
-          currentTabs.length === 1 && isPlaceholderTab(currentTabs[0]);
+        const onlyPlaceholder = shouldReplacePlaceholder(currentTabs);
 
         if (onlyPlaceholder) {
+          tabsRef.current = [nextTab];
           setTabs([nextTab]);
         } else {
-          setTabs((current) => [...current, nextTab]);
+          const nextTabs = [...currentTabs, nextTab];
+          tabsRef.current = nextTabs;
+          setTabs(nextTabs);
         }
 
+        activeTabIdRef.current = nextTab.id;
         setActiveTabId(nextTab.id);
         setSaveStatus("saved");
         clearError();
-        // Track mtime for external change detection
-        fileMtimesRef.current[path] = Date.now(); // fallback
-        void invoke<number | null>("get_file_mtime", { path }).then((mtime) => {
-          if (mtime != null) fileMtimesRef.current[path] = mtime;
-        });
+        if (mtime != null) fileMtimesRef.current[path] = mtime;
         return true;
       } catch (error) {
         console.error(error);
@@ -443,8 +439,7 @@ export function useFileSystem() {
   );
 
   const updateContent = useCallback((content: string) => {
-    setTabs((current) =>
-      current.map((tab) =>
+    const nextTabs = tabsRef.current.map((tab) =>
         tab.id === activeTabIdRef.current
           ? {
               ...tab,
@@ -452,8 +447,9 @@ export function useFileSystem() {
               saved: false,
             }
           : tab
-      )
     );
+    tabsRef.current = nextTabs;
+    setTabs(nextTabs);
   }, []);
 
   const renameTab = useCallback((tabId: string, nextName: string): boolean => {
@@ -461,40 +457,27 @@ export function useFileSystem() {
     if (!normalized) return false;
 
     const finalName = /\.[^\\/.\s]+$/.test(normalized) ? normalized : `${normalized}.md`;
-    let changed = false;
+    const target = tabsRef.current.find((tab) => tab.id === tabId);
+    if (!target || target.path) return false;
 
-    setTabs((current) =>
-      current.map((tab) => {
-        if (tab.id !== tabId || tab.path) return tab;
-        changed = true;
-        return {
-          ...tab,
-          name: finalName,
-        };
-      })
+    const nextTabs = tabsRef.current.map((tab) =>
+      tab.id === tabId ? { ...tab, name: finalName } : tab
     );
-
-    return changed;
+    tabsRef.current = nextTabs;
+    setTabs(nextTabs);
+    return true;
   }, []);
 
   const setTabPinned = useCallback((tabId: string, pinned: boolean): boolean => {
-    let changed = false;
+    const target = tabsRef.current.find((tab) => tab.id === tabId);
+    if (!target || target.pinned === pinned) return false;
 
-    setTabs((current) =>
-      current.map((tab) => {
-        if (tab.id !== tabId || tab.pinned === pinned) {
-          return tab;
-        }
-
-        changed = true;
-        return {
-          ...tab,
-          pinned,
-        };
-      })
+    const nextTabs = tabsRef.current.map((tab) =>
+      tab.id === tabId ? { ...tab, pinned } : tab
     );
-
-    return changed;
+    tabsRef.current = nextTabs;
+    setTabs(nextTabs);
+    return true;
   }, []);
 
   const saveTabs = useCallback(
@@ -522,7 +505,7 @@ export function useFileSystem() {
       // Clean up recovery files for untitled tabs being closed
       for (const tab of tabsRef.current) {
         if (closingSet.has(tab.id) && !tab.path) {
-          cleanupUntitledDoc(tab.id);
+          void cleanupUntitledDoc(tab.id);
         }
       }
 
@@ -532,7 +515,9 @@ export function useFileSystem() {
 
       if (nextTabs.length === 0) {
         // All tabs closed: go to empty state, let the UI show the home page.
-        // No fallback untitled tab is created — the user explicitly closed the last tab.
+        // No fallback untitled tab is created – the user explicitly closed the last tab.
+        tabsRef.current = [];
+        activeTabIdRef.current = null;
         setTabs([]);
         setActiveTabId(null);
         setSaveStatus("saved");
@@ -540,13 +525,11 @@ export function useFileSystem() {
         return true;
       }
 
-      const activeClosed = activeTabIdRef.current !== null && closingSet.has(activeTabIdRef.current);
-      const activeIndex = currentTabs.findIndex((tab) => tab.id === activeTabIdRef.current);
-      const fallbackIndex = activeIndex >= 0 ? Math.min(activeIndex, nextTabs.length - 1) : 0;
-      const nextActive = activeClosed
-        ? nextTabs[fallbackIndex] ?? nextTabs[nextTabs.length - 1]
-        : nextTabs.find((tab) => tab.id === activeTabIdRef.current) ?? nextTabs[0];
+      const nextActiveId = selectNextActive(currentTabs, [...closingSet], activeTabIdRef.current);
+      const nextActive = nextTabs.find((tab) => tab.id === nextActiveId) ?? nextTabs[0];
 
+      tabsRef.current = nextTabs;
+      activeTabIdRef.current = nextActive.id;
       setTabs(nextTabs);
       setActiveTabId(nextActive.id);
       clearError();
@@ -629,19 +612,15 @@ export function useFileSystem() {
   const reorderTabs = useCallback((sourceTabId: string, targetTabId: string) => {
     if (sourceTabId === targetTabId) return;
 
-    setTabs((current) => {
-      const sourceIndex = current.findIndex((tab) => tab.id === sourceTabId);
-      const targetIndex = current.findIndex((tab) => tab.id === targetTabId);
+    const sourceIndex = tabsRef.current.findIndex((tab) => tab.id === sourceTabId);
+    const targetIndex = tabsRef.current.findIndex((tab) => tab.id === targetTabId);
+    if (sourceIndex < 0 || targetIndex < 0) return;
 
-      if (sourceIndex < 0 || targetIndex < 0) {
-        return current;
-      }
-
-      const nextTabs = [...current];
-      const [sourceTab] = nextTabs.splice(sourceIndex, 1);
-      nextTabs.splice(targetIndex, 0, sourceTab);
-      return nextTabs;
-    });
+    const nextTabs = [...tabsRef.current];
+    const [sourceTab] = nextTabs.splice(sourceIndex, 1);
+    nextTabs.splice(targetIndex, 0, sourceTab);
+    tabsRef.current = nextTabs;
+    setTabs(nextTabs);
   }, []);
 
   const restoreTabs = useCallback((nextTabs: SessionTabState[], nextActiveTabId: string | null) => {
@@ -659,10 +638,38 @@ export function useFileSystem() {
       restoredTabs.find((tab) => tab.id === nextActiveTabId)?.id ?? restoredTabs[0].id;
 
     clearPendingSave();
+    tabsRef.current = restoredTabs;
+    activeTabIdRef.current = resolvedActiveId;
     setTabs(restoredTabs);
     setActiveTabId(resolvedActiveId);
     clearError();
   }, [clearError, clearPendingSave]);
+
+  const appendTabs = useCallback((nextTabs: SessionTabState[]) => {
+    if (nextTabs.length === 0) return;
+
+    const restoredTabs: FileState[] = nextTabs.map((tab) => ({
+      id: tab.id || createTabId(),
+      path: tab.path,
+      name: tab.name || (tab.path ? getFileName(tab.path) : UNTITLED_NAME),
+      content: tab.content ?? "",
+      saved: tab.saved ?? true,
+      pinned: tab.pinned ?? false,
+    }));
+
+    const existingIds = new Set(tabsRef.current.map((tab) => tab.id));
+    const uniqueTabs = restoredTabs.filter((tab) => !existingIds.has(tab.id));
+    if (uniqueTabs.length === 0) return;
+
+    const mergedTabs = [...tabsRef.current, ...uniqueTabs];
+    tabsRef.current = mergedTabs;
+    setTabs(mergedTabs);
+
+    if (!activeTabIdRef.current) {
+      activeTabIdRef.current = uniqueTabs[0].id;
+      setActiveTabId(uniqueTabs[0].id);
+    }
+  }, []);
 
   const getTabsSnapshot = useCallback(() => tabsRef.current, []);
 
@@ -709,7 +716,7 @@ export function useFileSystem() {
         const mtime = await invoke<number | null>("get_file_mtime", { path: tab.path });
         if (mtime == null) continue;
         const recorded = fileMtimesRef.current[tab.path];
-        if (recorded != null && mtime > recorded) {
+        if (recorded != null && mtime !== recorded) {
           changed.push(tab);
         }
       } catch {
@@ -763,6 +770,7 @@ export function useFileSystem() {
     saveTabs,
     getTabsSnapshot,
     restoreTabs,
+    appendTabs,
     markFileCurrent,
     checkExternalChanges,
     reloadTabFromDisk,

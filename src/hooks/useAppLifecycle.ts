@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import type { SessionState } from "./useSession";
 import type { FileState } from "./useFileSystem";
 
@@ -18,6 +19,7 @@ interface UseAppLifecycleParams {
     currentPath?: string | null
   ) => SessionState;
   activeTabId: string | null;
+  sessionReady: boolean;
   /** Needed to re-register the close listener after dialog dismiss (Tauri 2 quirk) */
   appCloseRequestDirty: number;
   /** Called when external file modifications are detected (for non-blocking toast). */
@@ -47,6 +49,7 @@ export function useAppLifecycle(params: UseAppLifecycleParams) {
     getTabsSnapshot,
     buildSessionState,
     activeTabId,
+    sessionReady,
     appCloseRequestDirty,
     onExternalChange,
     setInitialized,
@@ -57,11 +60,13 @@ export function useAppLifecycle(params: UseAppLifecycleParams) {
 
   // ── 1. External file-open listener (OS file association / single-instance forwarding) ──
   useEffect(() => {
+    if (!sessionReady) return;
+
     let disposed = false;
     const setup = async () => {
-      const unlisten = await listen<string[]>("open-file-paths", async (event) => {
+      const openPendingFiles = async () => {
         if (disposed) return;
-        const paths = event.payload;
+        const paths = await invoke<string[]>("take_pending_open_files").catch(() => []);
         if (paths.length === 0) return;
 
         try {
@@ -76,7 +81,10 @@ export function useAppLifecycle(params: UseAppLifecycleParams) {
             setHomeResumeTarget(null);
           }
         }
-      });
+      };
+
+      const unlisten = await listen("open-file-requested", openPendingFiles);
+      await openPendingFiles();
       return unlisten;
     };
 
@@ -85,7 +93,7 @@ export function useAppLifecycle(params: UseAppLifecycleParams) {
       disposed = true;
       void unlistenPromise.then((fn) => fn?.());
     };
-  }, [openFileByPath, setInitialized, setShowHome, setHomeResumeTarget]);
+  }, [openFileByPath, sessionReady, setInitialized, setShowHome, setHomeResumeTarget]);
 
   // ── 2. Window close helper (shared by direct-close and dialog-confirm paths) ──
   const requestWindowClose = useCallback(async (): Promise<boolean> => {
@@ -94,6 +102,7 @@ export function useAppLifecycle(params: UseAppLifecycleParams) {
       await getCurrentWindow().close();
       return true;
     } catch {
+      allowWindowCloseRef.current = false;
       return false;
     }
   }, [allowWindowCloseRef]);
@@ -151,26 +160,33 @@ export function useAppLifecycle(params: UseAppLifecycleParams) {
     const handleFocus = () => {
       if (checkingRef.current) return;
       checkingRef.current = true;
-      void checkExternalChanges().then((changedTabs) => {
-        checkingRef.current = false;
-        if (changedTabs.length === 0) return;
-        let reloaded = 0;
-        for (const tab of changedTabs) {
-          if (tab.saved) {
-            void reloadTabFromDisk(tab.id);
-            reloaded++;
+      void (async () => {
+        try {
+          const changedTabs = await checkExternalChanges();
+          if (changedTabs.length === 0) return;
+
+          let reloaded = 0;
+          let skipped = 0;
+          for (const tab of changedTabs) {
+            if (!tab.saved) {
+              skipped++;
+              continue;
+            }
+            if (await reloadTabFromDisk(tab.id)) {
+              reloaded++;
+            } else {
+              skipped++;
+            }
           }
+
+          if (reloaded > 0) onExternalChange?.(reloaded);
+          if (skipped > 0) {
+            console.info(`Skipped ${skipped} externally modified tab(s) that could not be safely reloaded.`);
+          }
+        } finally {
+          checkingRef.current = false;
         }
-        const skipped = changedTabs.length - reloaded;
-        // Notify the UI (toast)
-        if (reloaded > 0) onExternalChange?.(reloaded);
-        // If some tabs were skipped (user-modified), log it
-        if (skipped > 0) {
-          console.info(
-            `Skipped ${skipped} externally modified tab(s) with unsaved local changes.`
-          );
-        }
-      });
+      })();
     };
     window.addEventListener("focus", handleFocus);
     return () => window.removeEventListener("focus", handleFocus);

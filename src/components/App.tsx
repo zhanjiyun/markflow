@@ -43,6 +43,7 @@ import type { TabViewState } from "../types/tabState";
 import { exportPdf, saveAsHtml, saveAsPlainText } from "../utils/export";
 import { extractToc, getCharCount, getWordCount } from "../utils/markdown";
 import type { SearchableEditorHandle } from "../types/editorSearch";
+import { filterRecoveredUntitledDocs } from "../hooks/fileSystemLogic";
 
 const AIPanel = lazy(() => import("./AIPanel"));
 const AISettings = lazy(() => import("./AISettings"));
@@ -50,6 +51,7 @@ const AppSettings = lazy(() => import("./AppSettings"));
 const QuickSwitch = lazy(() => import("./QuickSwitch"));
 const SearchBar = lazy(() => import("./SearchBar"));
 const WysiwygEditor = lazy(() => import("./WysiwygEditor"));
+const APP_VERSION = __APP_VERSION__;
 
 type ViewMode = "edit" | "preview" | "split" | "wysiwyg";
 type EditMode = "wysiwyg" | "source";
@@ -144,9 +146,11 @@ export default function App() {
     saveTabs,
     getTabsSnapshot,
     restoreTabs,
+    appendTabs,
     checkExternalChanges,
     reloadTabFromDisk,
     loadUntitledRecoveryDocs,
+    cleanupUntitledDoc,
   } = useFileSystem();
   const {
     workspacePath,
@@ -397,6 +401,7 @@ export default function App() {
     getTabsSnapshot,
     buildSessionState,
     activeTabId,
+    sessionReady,
     appCloseRequestDirty: appCloseRequest ? 1 : 0,
     onExternalChange: (count) => {
       setToastMsg(`检测到 ${count} 个文件被外部修改，已自动重载。`);
@@ -574,7 +579,10 @@ export default function App() {
       tabViewStatesRef.current = Object.fromEntries(
         session.openTabs.map((tab) => [tab.id, tab.viewState ?? {}])
       );
-      if (session.openTabs.length > 0) {
+      const restoredSessionTabs = session.openTabs.length > 0;
+      let resumedCurrentFile = false;
+
+      if (restoredSessionTabs) {
         restoreTabs(session.openTabs, session.activeTabId);
         setInitialized(true);
       }
@@ -598,6 +606,7 @@ export default function App() {
       ) {
         const opened = await openFileByPath(session.currentFilePath);
         if (opened) {
+          resumedCurrentFile = true;
           setInitialized(true);
         }
       }
@@ -608,12 +617,17 @@ export default function App() {
       }
 
       // Recover orphaned untitled documents from disk
-      if (!cancelled && session.openTabs.length === 0) {
+      if (!cancelled) {
         try {
           const recoveredDocs = await loadUntitledRecoveryDocs();
-          if (recoveredDocs.length > 0) {
-            // Only recover if no real tabs were restored (avoid duplicates)
-            restoreTabs(recoveredDocs, recoveredDocs[0].id);
+          const existingSessionTabs = session.openTabs.map((tab) => ({ id: tab.id }));
+          const missingRecoveredDocs = filterRecoveredUntitledDocs(recoveredDocs, existingSessionTabs);
+          if (missingRecoveredDocs.length > 0) {
+            if (restoredSessionTabs || resumedCurrentFile) {
+              appendTabs(missingRecoveredDocs);
+            } else {
+              restoreTabs(missingRecoveredDocs, missingRecoveredDocs[0].id);
+            }
             setInitialized(true);
           }
         } catch { /* ignore recovery errors */ }
@@ -627,7 +641,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [loadSession, loadUntitledRecoveryDocs, openFileByPath, openFolderByPath, restoreTabs]);
+  }, [appendTabs, loadSession, loadUntitledRecoveryDocs, openFileByPath, openFolderByPath, restoreTabs]);
 
   useEffect(() => {
     if (!sessionReady) return;
@@ -1009,6 +1023,7 @@ export default function App() {
           }
 
           if (!tab.path) {
+            await cleanupUntitledDoc(tab.id);
             continue;
           }
 
@@ -1047,6 +1062,7 @@ export default function App() {
       activeTabId,
       buildSessionState,
       captureActiveTabViewState,
+      cleanupUntitledDoc,
       getTabsSnapshot,
       saveSession,
       saveTabs,
@@ -1867,7 +1883,7 @@ export default function App() {
             onOpenDataDir={() => {
               void invoke("open_app_data_dir").catch(() => {});
             }}
-            version="1.0.2"
+            version={APP_VERSION}
             onClose={() => setShowAppSettings(false)}
           />
         )}

@@ -4,6 +4,19 @@ on:
   push:
     tags:
       - 'v*'
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build and publish (for example, v1.0.2)
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag || github.ref_name || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   release:
@@ -12,6 +25,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -22,8 +37,14 @@ jobs:
           toolchain: stable-x86_64-pc-windows-msvc
 
       - run: npm ci
+      - run: npm run lint
+      - run: npm run test:markdown
+      - run: npm run test:untitled
+      - run: npm run test:filesystem
+      - run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
       - run: npx tauri build
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
           files: src-tauri/target/release/bundle/nsis/*setup.exe

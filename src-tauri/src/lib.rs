@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
@@ -201,8 +201,51 @@ fn session_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn session_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    session_dir(app).map(|d| d.join("session.json"))
+fn is_valid_json(data: &str) -> bool {
+    matches!(
+        serde_json::from_str::<serde_json::Value>(data),
+        Ok(serde_json::Value::Object(_))
+    )
+}
+
+fn write_synced_file(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    let mut file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    file.write_all(data).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination_wide: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    let result = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+
+    if result == 0 {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> Result<(), String> {
+    std::fs::rename(source, destination).map_err(|e| e.to_string())
 }
 
 /// Atomic save: write to a temp file first, then rename to the real path.
@@ -210,22 +253,29 @@ fn session_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 /// file (e.g. crash mid-write) can be recovered from.
 #[tauri::command]
 fn save_session(app: tauri::AppHandle, data: String) -> Result<(), String> {
+    if !is_valid_json(&data) {
+        return Err("Refusing to save an invalid session document".to_string());
+    }
+
     let dir = session_dir(&app)?;
     let path = dir.join("session.json");
     let tmp = dir.join("session.json.tmp");
     let bak = dir.join("session.json.bak");
 
-    // Write new session to temp file
-    std::fs::write(&tmp, data.as_bytes()).map_err(|e| format!("写入临时文件失败: {}", e))?;
+    // Flush the complete new session before replacing the live file.
+    write_synced_file(&tmp, data.as_bytes())
+        .map_err(|e| format!("Failed to write temporary session file: {e}"))?;
 
-    // If an existing session file is present, keep it as backup
+    // Only replace a known-good backup with a valid previous session.
     if path.exists() {
-        // Ignore errors on backup — best effort
-        let _ = std::fs::copy(&path, &bak);
+        if let Ok(previous) = std::fs::read_to_string(&path) {
+            if is_valid_json(&previous) {
+                let _ = std::fs::copy(&path, &bak);
+            }
+        }
     }
 
-    // Atomic rename from temp to real path
-    std::fs::rename(&tmp, &path).map_err(|e| format!("替换会话文件失败: {}", e))?;
+    replace_file(&tmp, &path).map_err(|e| format!("Failed to replace session file: {e}"))?;
 
     Ok(())
 }
@@ -239,7 +289,7 @@ fn load_session(app: tauri::AppHandle) -> Result<String, String> {
     // Try the main file first
     if path.exists() {
         if let Ok(data) = std::fs::read_to_string(&path) {
-            if !data.trim().is_empty() {
+            if is_valid_json(&data) {
                 return Ok(data);
             }
         }
@@ -248,9 +298,12 @@ fn load_session(app: tauri::AppHandle) -> Result<String, String> {
     // Main file missing / empty / corrupt — try backup
     if bak.exists() {
         if let Ok(data) = std::fs::read_to_string(&bak) {
-            if !data.trim().is_empty() {
-                // Restore the backup as the main file
-                let _ = std::fs::copy(&bak, &path);
+            if is_valid_json(&data) {
+                // Restore through the same safe replacement path. Recovery still
+                // succeeds for this launch if the best-effort repair cannot run.
+                if write_synced_file(&tmp, data.as_bytes()).is_ok() {
+                    let _ = replace_file(&tmp, &path);
+                }
                 return Ok(data);
             }
         }
@@ -264,15 +317,24 @@ fn open_app_data_dir(app: tauri::AppHandle) -> Result<(), String> {
     let dir = session_dir(&app)?;
     #[cfg(target_os = "windows")]
     {
-        Command::new("explorer").arg(dir).spawn().map_err(|e| e.to_string())?;
+        Command::new("explorer")
+            .arg(dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
     }
     #[cfg(target_os = "macos")]
     {
-        Command::new("open").arg(dir).spawn().map_err(|e| e.to_string())?;
+        Command::new("open")
+            .arg(dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        Command::new("xdg-open").arg(dir).spawn().map_err(|e| e.to_string())?;
+        Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -344,31 +406,58 @@ fn remove_untitled_doc(app: tauri::AppHandle, id: String) -> Result<(), String> 
 /// The first instance binds this port; subsequent instances connect and forward file paths.
 const INSTANCE_PORT: u16 = 48721;
 
-fn run_first_instance(startup_files: Vec<String>, listener: TcpListener) {
+#[derive(Debug, Serialize, Deserialize)]
+struct InstanceMessage {
+    paths: Vec<String>,
+}
+
+struct PendingOpenFiles(std::sync::Mutex<Vec<String>>);
+
+#[tauri::command]
+fn take_pending_open_files(state: tauri::State<'_, PendingOpenFiles>) -> Vec<String> {
+    state
+        .0
+        .lock()
+        .map(|mut pending| std::mem::take(&mut *pending))
+        .unwrap_or_default()
+}
+
+fn queue_open_files(app: &tauri::AppHandle, paths: Vec<String>) {
+    if paths.is_empty() {
+        return;
+    }
+
+    if let Some(state) = app.try_state::<PendingOpenFiles>() {
+        if let Ok(mut pending) = state.0.lock() {
+            pending.extend(paths);
+        }
+    }
+}
+
+fn run_first_instance(startup_files: Vec<String>, listener: Option<TcpListener>) {
     let (tx, rx) = std::sync::mpsc::channel::<Vec<String>>();
 
-    // Background thread: accept TCP connections from other instances
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            if let Ok(mut stream) = stream {
-                let mut buf = String::new();
-                if stream.read_to_string(&mut buf).is_ok() {
-                    let paths: Vec<String> = buf
-                        .lines()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    if !paths.is_empty() {
-                        let _ = tx.send(paths);
+    if let Some(listener) = listener {
+        // Background thread: accept activation and file-open requests from later instances.
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if let Ok(mut stream) = stream {
+                    let mut buf = String::new();
+                    if stream.read_to_string(&mut buf).is_ok() {
+                        if let Ok(message) = serde_json::from_str::<InstanceMessage>(&buf) {
+                            // Empty paths still mean "activate the existing window".
+                            let _ = tx.send(message.paths);
+                        }
                     }
                 }
             }
-        }
-    });
+        });
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .manage(PendingOpenFiles(std::sync::Mutex::new(startup_files)))
         .setup(move |app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -380,16 +469,6 @@ fn run_first_instance(startup_files: Vec<String>, listener: TcpListener) {
 
             let handle = app.handle().clone();
 
-            // Emit initial startup files after a delay so the frontend has mounted
-            if !startup_files.is_empty() {
-                let handle2 = handle.clone();
-                let files = startup_files.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1200));
-                    let _ = handle2.emit("open-file-paths", files);
-                });
-            }
-
             // Watch for incoming file paths forwarded from other instances.
             // Restore the window (unminimize, show, focus) before emitting so the
             // user sees the app come to the front when double-clicking a file.
@@ -400,7 +479,10 @@ fn run_first_instance(startup_files: Vec<String>, listener: TcpListener) {
                         let _ = window.unminimize();
                         let _ = window.set_focus();
                     }
-                    let _ = handle.emit("open-file-paths", paths);
+                    if !paths.is_empty() {
+                        queue_open_files(&handle, paths);
+                        let _ = handle.emit("open-file-requested", ());
+                    }
                 }
             });
 
@@ -417,6 +499,7 @@ fn run_first_instance(startup_files: Vec<String>, listener: TcpListener) {
             save_untitled_docs,
             load_untitled_docs,
             remove_untitled_doc,
+            take_pending_open_files,
             open_app_data_dir,
             exit_app
         ])
@@ -424,17 +507,16 @@ fn run_first_instance(startup_files: Vec<String>, listener: TcpListener) {
         .expect("error while running tauri application");
 }
 
-fn forward_to_existing_instance(startup_files: &[String]) {
-    if startup_files.is_empty() {
-        return;
-    }
+fn forward_to_existing_instance(startup_files: &[String]) -> bool {
     if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", INSTANCE_PORT)) {
-        use std::io::Write;
-        let data = startup_files.join("\n");
-        // Ignore errors — the existing instance may have already shut down
-        let _ = stream.write_all(data.as_bytes());
-        let _ = stream.flush();
+        let message = InstanceMessage {
+            paths: startup_files.to_vec(),
+        };
+        if let Ok(data) = serde_json::to_vec(&message) {
+            return stream.write_all(&data).and_then(|_| stream.flush()).is_ok();
+        }
     }
+    false
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -444,12 +526,14 @@ pub fn run(startup_files: Vec<String>) {
     // Subsequent instances forward their file paths to the first instance and exit.
     match TcpListener::bind(("127.0.0.1", INSTANCE_PORT)) {
         Ok(listener) => {
-            run_first_instance(startup_files, listener);
+            run_first_instance(startup_files, Some(listener));
         }
         Err(_) => {
-            // Port is already bound → another instance is running.
-            // Forward file paths to the existing instance and exit.
-            forward_to_existing_instance(&startup_files);
+            // If this is MarkFlow, ask it to activate and optionally open files.
+            // If another process owns the port, continue in standalone mode.
+            if !forward_to_existing_instance(&startup_files) {
+                run_first_instance(startup_files, None);
+            }
         }
     }
 }
