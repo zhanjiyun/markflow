@@ -284,6 +284,7 @@ fn save_session(app: tauri::AppHandle, data: String) -> Result<(), String> {
 fn load_session(app: tauri::AppHandle) -> Result<String, String> {
     let dir = session_dir(&app)?;
     let path = dir.join("session.json");
+    let tmp = dir.join("session.json.tmp");
     let bak = dir.join("session.json.bak");
 
     // Try the main file first
