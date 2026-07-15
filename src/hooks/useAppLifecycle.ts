@@ -99,22 +99,27 @@ export function useAppLifecycle(params: UseAppLifecycleParams) {
   const requestWindowClose = useCallback(async (): Promise<boolean> => {
     allowWindowCloseRef.current = true;
     try {
-      await getCurrentWindow().close();
+      await invoke("exit_app");
       return true;
-    } catch {
+    } catch (error) {
+      console.error("Failed to exit application:", error);
       allowWindowCloseRef.current = false;
       return false;
     }
   }, [allowWindowCloseRef]);
 
   // ── 3. Window close request handler ──
+  const closingRef = useRef(false);
   useEffect(() => {
+    let disposed = false;
     let unlisten: (() => void) | null = null;
     try {
       void getCurrentWindow()
         .onCloseRequested(async (event) => {
           if (allowWindowCloseRef.current) return;
           event.preventDefault();
+          if (closingRef.current) return;
+          closingRef.current = true;
           captureActiveTabViewState();
 
           const sessionTabs = getTabsSnapshot();
@@ -128,18 +133,29 @@ export function useAppLifecycle(params: UseAppLifecycleParams) {
             await saveSession(
               buildSessionState(sessionTabs, activeTabId, currentPath)
             ).catch((e) => console.error("Failed to save session before close:", e));
-            await requestWindowClose();
+            const closed = await requestWindowClose();
+            if (!closed) closingRef.current = false;
             return;
           }
 
           setAppCloseRequest({ unsavedTabs });
+          closingRef.current = false;
         })
         .then((dispose) => {
-          unlisten = dispose;
+          if (disposed) {
+            dispose();
+          } else {
+            unlisten = dispose;
+          }
+        })
+        .catch((error) => {
+          closingRef.current = false;
+          console.error("Failed to register close handler:", error);
         });
     } catch { /* browser dev mode */ }
 
     return () => {
+      disposed = true;
       unlisten?.();
     };
   }, [

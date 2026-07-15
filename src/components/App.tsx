@@ -1055,8 +1055,14 @@ export default function App() {
       }
 
       allowWindowCloseRef.current = true;
-      await invoke("exit_app");
-      return true;
+      try {
+        await invoke("exit_app");
+        return true;
+      } catch (error) {
+        allowWindowCloseRef.current = false;
+        console.error("Failed to exit application:", error);
+        return false;
+      }
     },
     [
       activeTabId,
